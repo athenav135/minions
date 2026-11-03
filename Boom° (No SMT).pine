@@ -2164,6 +2164,8 @@ type SeqLaneSt
     float    dnRO   = na
     float    lUpRO  = na
     float    lDnRO  = na
+    int      bD     = na    // sequence candle of the data check below
+    bool     bad    = false // a bar of this sequence candle had no entry data → entry not shown (no guessing)
 
 // A completed execution candle: after the sweep the extreme candle anchors the level (open of the
 // opposite run leading into it); a later candle closing strictly beyond it is the CISD; a new
@@ -2315,16 +2317,26 @@ method feed(SeqLaneSt st, int dT, array<int> t, array<float> o, array<float> h, 
 // Boom lane on its entry timeframe etf: the chart's bars when the chart is not above etf, else the etf
 // candles inside each chart bar. No etf data → sweep only, from the chart's bars when the chart is not
 // above the sweep timeframe. Returns [sweep tracked, entry tracked] (else the table shows '--').
+// Exact entry candles only: the chart's bars when the chart divides the entry TF (1m → any, 3m → 3m, 5m → 5m),
+// the entry-TF candles inside each chart bar when the entry TF divides the chart (15m chart → 5m / 3m), else 1m
+// candles on clock windows (3m chart → 5m, 5m chart → 3m). A bar without that data → entry not shown for this
+// sequence candle (sweep from the chart's bars when the chart divides the sweep TF).
 SeqLaneFeed(SeqLaneSt ln, int dT, string etf, int ewT, int ewC) =>
-    bool own = timeframe.in_seconds() <= timeframe.in_seconds(etf)
-    [bt, bo, bh, bl, bc] = SeqBars(own, etf)
+    int  cs   = timeframe.in_seconds()
+    bool own  = timeframe.in_seconds(etf) % cs == 0
+    bool sub  = not own and cs % timeframe.in_seconds(etf) == 0
+    [bt, bo, bh, bl, bc] = SeqBars(own, sub ? etf : '1')
     bool full = bt.size() > 0
-    bool swok = full or timeframe.in_seconds() * 1000 <= ln.sMs
+    if dT != ln.bD
+        ln.bD  := dT
+        ln.bad := false
+    ln.bad := ln.bad or not full
+    bool swok = full or ln.sMs % (cs * 1000) == 0
     if full
-        ln.feed(dT, bt, bo, bh, bl, bc, true, own ? ewT : na, not own or ewC == time_close, false)
+        ln.feed(dT, bt, bo, bh, bl, bc, own or sub, own ? ewT : na, not own or ewC == time_close, false)
     else if swok
         ln.feed(dT, array.from(time), array.from(open), array.from(high), array.from(low), array.from(close), true, na, false, true)
-    [swok, full]
+    [swok, not ln.bad]
 
 // Middle column: sweep row = the C1 candle (open time) that was taken, or the C1 being watched;
 // entry row = time the CISD happened (close of the execution candle that confirmed it)
@@ -2603,10 +2615,10 @@ if (seq_show_input or alerts_enabled_input) and seq_tf_ok
     SeqTrack seq_tb = seq_dbias == 1 ? seq_lb.bu : seq_lb.be
     bool seq_a_cur = seq_live and seq_la.dId == seq_dT and not na(seq_ta)
     bool seq_b_cur = seq_live and seq_lb.dId == seq_dT and not na(seq_tb)
-    seq_a_sweep := seq_a_cur and seq_ta.s
-    seq_a_entry := seq_a_cur and seq_ta.e
-    seq_b_sweep := seq_b_cur and seq_tb.s
-    seq_b_entry := seq_b_cur and seq_tb.e
+    seq_a_sweep := seq_a_cur and seq_ta.s and seq_lnOk.get(0)
+    seq_a_entry := seq_a_cur and seq_ta.e and seq_lnOk.get(1)
+    seq_b_sweep := seq_b_cur and seq_tb.s and seq_lnOk.get(2)
+    seq_b_entry := seq_b_cur and seq_tb.e and seq_lnOk.get(3)
     // alerts (Boom): each new C1 sweep / entry CISD of a lane while the table counts it
     // ('Conditions: C3 Only' on → only in C3)
     var array<int> seq_alId = array.from(0, 0, 0, 0)    // last alerted sweep / CISD time: A sweep, A CISD, B sweep, B CISD
@@ -2668,9 +2680,9 @@ if barstate.islast and dash_show_input
 // Sequence table — drawing (last bar)
 // ============================================================================
 SeqStatus(bool prevDone, bool done, bool ok) =>
-    string txt = not ok ? '--' : done ? 'DONE' : prevDone ? 'WATCHING' : 'NOT YET'
-    color  col = done ? seq_done_input : prevDone ? seq_watch_input : seq_wait_input
-    string ico = done ? '✓ ' : prevDone ? '◔ ' : '·  '
+    string txt = not ok ? 'platform err' : done ? 'DONE' : prevDone ? 'WATCHING' : 'NOT YET'
+    color  col = not ok ? seq_wait_input : done ? seq_done_input : prevDone ? seq_watch_input : seq_wait_input
+    string ico = not ok ? '·  ' : done ? '✓ ' : prevDone ? '◔ ' : '·  '
     [txt, col, ico]
 
 SeqCell(table t, int c, int r, string s, color k, color g, string a) =>
@@ -2812,11 +2824,11 @@ if barstate.islast and seq_show_input and seq_tf_ok
             r += 1
         else
             r := SeqRow(seq_tbl, r, mr, '▸ LANE A', wt, ln, as_lbl + ' ▸ ' + ae_lbl, wt, ln, R, '', wt, false)
-            r := SeqRow(seq_tbl, r, mr, a1i + as_lbl + ' sweep', tx, rw, c2_ok ? SeqC1Txt(seq_la, seq_dbias, a_sw) : '', a_sw ? seq_done_input : wt, rw, L, a1t, a1c, true)
-            r := SeqRow(seq_tbl, r, mr, a2i + ae_lbl + ' entry', tx, rw, a_en ? SeqCisdTxt(seq_la, seq_dbias) : '', tx, rw, L, a2t, a2c, true)
+            r := SeqRow(seq_tbl, r, mr, a1i + as_lbl + ' sweep', tx, rw, not seq_lnOk.get(0) ? '--' : c2_ok ? SeqC1Txt(seq_la, seq_dbias, a_sw) : '', a_sw ? seq_done_input : wt, rw, L, a1t, a1c, true)
+            r := SeqRow(seq_tbl, r, mr, a2i + ae_lbl + ' entry', tx, rw, not seq_lnOk.get(1) ? '--' : a_en ? SeqCisdTxt(seq_la, seq_dbias) : '', tx, rw, L, a2t, a2c, true)
             r := SeqRow(seq_tbl, r, mr, '▸ LANE B', wt, ln, bs_lbl + ' ▸ ' + be_lbl, wt, ln, R, '', wt, false)
-            r := SeqRow(seq_tbl, r, mr, b1i + bs_lbl + ' sweep', tx, rw, c2_ok ? SeqC1Txt(seq_lb, seq_dbias, b_sw) : '', b_sw ? seq_done_input : wt, rw, L, b1t, b1c, true)
-            r := SeqRow(seq_tbl, r, mr, b2i + be_lbl + ' entry', tx, rw, b_en ? SeqCisdTxt(seq_lb, seq_dbias) : '', tx, rw, L, b2t, b2c, true)
+            r := SeqRow(seq_tbl, r, mr, b1i + bs_lbl + ' sweep', tx, rw, not seq_lnOk.get(2) ? '--' : c2_ok ? SeqC1Txt(seq_lb, seq_dbias, b_sw) : '', b_sw ? seq_done_input : wt, rw, L, b1t, b1c, true)
+            r := SeqRow(seq_tbl, r, mr, b2i + be_lbl + ' entry', tx, rw, not seq_lnOk.get(3) ? '--' : b_en ? SeqCisdTxt(seq_lb, seq_dbias) : '', tx, rw, L, b2t, b2c, true)
             r := SeqRow(seq_tbl, r, mr, 'EXECUTION', wt, rw, ex_tx, #ffffff, ex_c, C, '', wt, false)
             r := SeqRow(seq_tbl, r, mr, bar_tx, bar_col, rw, str.tostring(done_n) + ' / 4', wt, rw, R, '', wt, false)
     var bool seq_merged = false
